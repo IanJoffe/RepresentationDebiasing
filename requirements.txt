@@ -1,0 +1,11 @@
+numpy==1.26.4
+pandas==2.2.2
+torch==2.3.0
+#jax==0.4.28
+#jaxlib==0.4.28+cuda12.cudnn86 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+penzai==0.2.0
+kagglehub==0.2.5
+sentencepiece==0.2.0
+orbax==0.1.9
+ipywidgets==8.1.2
+matplotlib==3.9.0
