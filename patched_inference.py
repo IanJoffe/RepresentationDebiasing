@@ -1,7 +1,7 @@
 import argparse
 import json
 import submitit
-import os
+import os, tempfile
 from pathlib import Path
 import pickle
 
@@ -20,14 +20,13 @@ from jax.experimental import mesh_utils
 import sentencepiece as spm
 
 
-PATCHING_ACTIVATION_NUM = 15
-STEERING_COEF = -0.01
-
-INFERENCE_BATCH_SIZE = 2
-SAVE_FREQUENCY = 20
-INITIAL_POSITION = 0
-ENDING_POSITION = 200
-
+def atomic_pickle_dump(obj, target_path):
+    with tempfile.NamedTemporaryFile(dir=target_path.parent, delete=False) as tf:
+        pickle.dump(obj, tf, protocol=pickle.HIGHEST_PROTOCOL)
+        tf.flush()
+        os.fsync(tf.fileno())
+        temp_name = tf.name
+    os.replace(temp_name, target_path)
 
 def load_base_model():
 
@@ -159,7 +158,9 @@ def main():
     summaries_df["true_party"] = np.select([summaries_df["D Sponsors"] >= 4*summaries_df["R Sponsors"],
                             summaries_df["D Sponsors"]*4 <= summaries_df["R Sponsors"]],
                            [-1, 1], default=0)
-    summaries_df_sample = summaries_df.sample(n=10000, replace=False, weights=(summaries_df["true_party"]!=0), random_state=137).reset_index(drop=True)
+    training_summaries_df_sample = summaries_df.sample(n=10000, replace=False, weights=(summaries_df["true_party"]!=0), random_state=137)
+    summaries_df_sample = summaries_df.drop(training_summaries_df_sample.index).sample(n=10000, random_state=137).reset_index(drop=True)
+    del training_summaries_df_sample
 
     model, vocab = load_base_model()
 
@@ -181,17 +182,18 @@ def main():
     
     D1out, D2out, R1out, R2out, N1out, N2out = [], [], [], [], [], []
     outputs = [D1out, D2out, R1out, R2out, N1out, N2out]
-    pickle_files = {"D1out":"/net/scratch2/ianjoffe/activations/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/D1out.pkl",
-                    "D2out":"/net/scratch2/ianjoffe/activations/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/D2out.pkl",
-                    "R1out":"/net/scratch2/ianjoffe/activations/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/R1out.pkl",
-                    "R2out":"/net/scratch2/ianjoffe/activations/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/R2out.pkl",
-                    "N1out":"/net/scratch2/ianjoffe/activations/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/N1out.pkl",
-                    "N2out":"/net/scratch2/ianjoffe/activations/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/N2out.pkl"}
+    saving_dir_prefix = "/net/scratch2/ianjoffe/"
+    pickle_files = {"D1out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/D1out.pkl",
+                    "D2out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/D2out.pkl",
+                    "R1out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/R1out.pkl",
+                    "R2out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/R2out.pkl",
+                    "N1out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/N1out.pkl",
+                    "N2out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/N2out.pkl"}
     
-    with open("model_outputs/unpatched/train/D1out.pkl", "rb") as f: D1out_original = pickle.load(f)
-    with open("model_outputs/unpatched/train/R1out.pkl", "rb") as f: R1out_original = pickle.load(f)
-    with open("model_outputs/unpatched/train/D1stream.pkl", "rb") as f: D1stream_original = pickle.load(f)
-    with open("model_outputs/unpatched/train/R1stream.pkl", "rb") as f: R1stream_original = pickle.load(f)
+    with open(saving_dir_prefix + "/outputs/unpatched/train/D1out.pkl", "rb") as f: D1out_original = pickle.load(f)
+    with open(saving_dir_prefix + "/outputs/unpatched/train/R1out.pkl", "rb") as f: R1out_original = pickle.load(f)
+    with open(saving_dir_prefix + "/activations/unpatched/train/D1stream.pkl", "rb") as f: D1stream_original = pickle.load(f)
+    with open(saving_dir_prefix + "/activations/unpatched/train/R1stream.pkl", "rb") as f: R1stream_original = pickle.load(f)
 
     
     threshold = 0.1
@@ -222,33 +224,27 @@ def main():
     
         print("Completed Inference on " + str(i + INFERENCE_BATCH_SIZE - 1) + " bill")
         
-        if ((i+1) % SAVE_FREQUENCY == 0) or (i >= ENDING_POSITION-INFERENCE_BATCH_SIZE):    # might need to change the i+1 to i if inference_batch_size > 1 
-            # save outputs persistently
+        if (i % SAVE_FREQUENCY == SAVE_FREQUENCY % INFERENCE_BATCH_SIZE) or (i >= ENDING_POSITION-INFERENCE_BATCH_SIZE):
+            # save activtions and outputs persistently
             
             for p in range(num_prompts):
                 outputs[p][0] = pz.nx.concatenate(outputs[p], "bill")
-    
+
             for lst in pickle_files.keys():
                 if Path(pickle_files[lst]).is_file():
                     with open(pickle_files[lst], "rb") as f:
                         previous_entries = pickle.load(f)
                     updated_entries = pz.nx.concatenate([previous_entries, eval(lst)[0]], "bill")
-                    with open(pickle_files[lst], "wb") as f:
-                        pickle.dump(updated_entries, f)
-                    with open(pickle_files[lst][:-4] + "_backup.pkl", "wb") as f:
-                        pickle.dump(updated_entries, f) 
+                    atomic_pickle_dump(updated_entries, Path(pickle_files[lst]))
                 else:
-                    Path(pickle_files[lst]).parent.mkdir(parents=True, exist_ok=True)
                     with open(pickle_files[lst], "wb") as f:
                         pickle.dump(eval(lst)[0], f) 
-                    with open(pickle_files[lst][:-4] + "_backup.pkl", "wb") as f:
-                        pickle.dump(eval(lst)[0], f) 
-    
+
             # reset runtime data after saving persistently
             D1out, D2out, R1out, R2out, N1out, N2out = [], [], [], [], [], []
             outputs = [D1out, D2out, R1out, R2out, N1out, N2out]
-            
-            print("Saved up to bill " + str(i+INFERENCE_BATCH_SIZE-1))
+                    
+            print("Saved up to bill " + str(i+INFERENCE_BATCH_SIZE-1) + " (inclusive)")
 
 
 if __name__ == "__main__":
@@ -258,6 +254,15 @@ if __name__ == "__main__":
     query_path = Path(args.query).resolve()
     with open(query_path) as f:
         query = json.load(f)
+
+    INFERENCE_BATCH_SIZE = query.get("INFERENCE_BATCH_SIZE")
+    SAVE_FREQUENCY = query.get("SAVE_FREQUENCY")
+    INITIAL_POSITION = query.get("INITIAL_POSITION")
+    ENDING_POSITION = query.get("ENDING_POSITION")
+
+    PATCHING_ACTIVATION_NUM = query.get("PATCHING_ACTIVATION_NUM")
+    STEERING_COEF = query.get("STEERING_COEF")
+
 
     output_directory = Path("submitit_outputs").resolve()
     executor = submitit.AutoExecutor(folder=output_directory)

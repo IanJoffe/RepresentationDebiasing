@@ -1,7 +1,7 @@
 import argparse
 import json
 import submitit
-import os
+import os, tempfile
 from pathlib import Path
 import pickle
 
@@ -20,6 +20,13 @@ import orbax.checkpoint
 from jax.experimental import mesh_utils
 import sentencepiece as spm
 
+def atomic_pickle_dump(obj, target_path):
+    with tempfile.NamedTemporaryFile(dir=target_path.parent, delete=False) as tf:
+        pickle.dump(obj, tf, protocol=pickle.HIGHEST_PROTOCOL)
+        tf.flush()
+        os.fsync(tf.fileno())
+        temp_name = tf.name
+    os.replace(temp_name, target_path)
 
 def load_base_model():
 
@@ -75,6 +82,8 @@ def tokenize_and_pad_vectorized(prompts, vocab, pad_value=None, padding_last=Fal
 
 
 def main():
+    print(query)
+
     summaries_df = pd.read_csv("bill_summaries_and_sponsors.csv")
     summaries_df["true_party"] = np.select([summaries_df["D Sponsors"] >= 4*summaries_df["R Sponsors"],
                             summaries_df["D Sponsors"]*4 <= summaries_df["R Sponsors"]],
@@ -145,7 +154,7 @@ def main():
 
         print("Completed Inference on " + str(i) + " bill")
         
-        if ((i+1) % SAVE_FREQUENCY == 0) or (i >= ENDING_POSITION-INFERENCE_BATCH_SIZE):
+        if (i % SAVE_FREQUENCY == SAVE_FREQUENCY % INFERENCE_BATCH_SIZE) or (i >= ENDING_POSITION-INFERENCE_BATCH_SIZE):
             # save activtions and outputs persistently
             
             for p in range(num_prompts):
@@ -157,8 +166,7 @@ def main():
                     with open(pickle_files[lst], "rb") as f:
                         previous_entries = pickle.load(f)
                     updated_entries = pz.nx.concatenate([previous_entries, eval(lst)[0]], "bill")
-                    with open(pickle_files[lst], "wb") as f:
-                        pickle.dump(updated_entries, f) 
+                    atomic_pickle_dump(updated_entries, Path(pickle_files[lst]))
                 else:
                     with open(pickle_files[lst], "wb") as f:
                         pickle.dump(eval(lst)[0], f) 
