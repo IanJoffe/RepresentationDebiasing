@@ -154,6 +154,8 @@ def get_debiased_model(original_model, activation_num, direction=None, DStream_d
 
 
 def main():
+    print(query)
+
     summaries_df = pd.read_csv("bill_summaries_and_sponsors.csv")
     summaries_df["true_party"] = np.select([summaries_df["D Sponsors"] >= 4*summaries_df["R Sponsors"],
                             summaries_df["D Sponsors"]*4 <= summaries_df["R Sponsors"]],
@@ -201,14 +203,17 @@ def main():
     partisan_ranks = jax.device_get(partisan_scores.untag("bill").unwrap()).argsort()
     selected_idxs = np.concatenate([partisan_ranks[:int(len(partisan_ranks) * threshold)], partisan_ranks[int(len(partisan_ranks) * (1-threshold)):]])
     
-    summaries_df_minisample = summaries_df_sample.iloc[selected_idxs].reset_index(drop=False, names="supersample_idx")
-    debiased_model = get_debiased_model(model, PATCHING_ACTIVATION_NUM, DStream_data=D1stream_original, RStream_data=R1stream_original, factor=STEERING_COEF)
+    # summaries_df_minisample = training_summaries_df_sample.iloc[selected_idxs].reset_index(drop=False, names="supersample_idx")
+    debiased_model = get_debiased_model(model, PATCHING_ACTIVATION_NUM,
+                                        DStream_data=D1stream_original.untag("bill")[selected_idxs].tag("bill"),
+                                        RStream_data=R1stream_original.untag("bill")[selected_idxs].tag("bill"),
+                                        factor=STEERING_COEF)
     
     
     for i in range(INITIAL_POSITION, ENDING_POSITION, INFERENCE_BATCH_SIZE):
     
         # prepare model input for batch
-        selected_rows = summaries_df_minisample.iloc[i:min(i+INFERENCE_BATCH_SIZE, len(summaries_df_minisample))]
+        selected_rows = summaries_df_sample.iloc[i:min(i+INFERENCE_BATCH_SIZE, len(summaries_df_sample))]
         prompts = pd.concat([selected_rows["summary"].apply(p) for p in all_prompts_patching]).reset_index(drop=True)
         tokenized_prompts, attention_masks = tokenize_and_pad_vectorized(prompts, vocab, padding_last=False)    # TODO: need to further investigate the padding
         input_batch = pz.nx.wrap(tokenized_prompts).tag("prompt", "seq")
