@@ -4,6 +4,7 @@ import submitit
 import os, tempfile
 from pathlib import Path
 import pickle
+from dataclasses import replace as dc_replace
 
 import jax
 import jax.numpy as jnp
@@ -55,13 +56,34 @@ def load_base_model():
     
     model = variants.gemma.gemma_from_pretrained_checkpoint(flat_params, upcast_activations_to_float32=True)
 
-    model_saving_intermediates = (
-        pz.select(model)
-        .at_instances_of(penzai.models.transformer.model_parts.TransformerBlock)
-        .apply_and_inline(
-            lambda l: [l, save_intermediates.SaveIntermediate(pz.StateVariable(None))]
+    assert REPRESENT_AT in ["post-feedforward", "pre-feedforward"]
+    if REPRESENT_AT == "post-feedforward":
+        model_saving_intermediates = (
+            pz.select(model)
+            .at_instances_of(penzai.models.transformer.model_parts.TransformerBlock)
+            .apply_and_inline(
+                lambda l: [l, save_intermediates.SaveIntermediate(pz.StateVariable(None))]
+            )
         )
-    )
+    elif REPRESENT_AT == "pre-feedforward":
+        def add_z_tap(attn):
+            einsum, w_o = attn.attn_value_to_output.sublayers
+            tapped_seq = pz.nn.Sequential(
+                [
+                    einsum,                                        
+                    save_intermediates.SaveIntermediate(
+                        pz.StateVariable(None)                   
+                    ),
+                    w_o,                                          
+                ]
+            )
+            return dc_replace(attn, attn_value_to_output=tapped_seq)
+
+        model_saving_intermediates = (
+            pz.select(model)
+            .at_instances_of( penzai.nn.attention.Attention)
+            .apply_and_inline(lambda attn: [add_z_tap(attn)])
+        )
 
     return model_saving_intermediates, vocab
     
@@ -118,12 +140,12 @@ def main():
                     "R2out":"/net/scratch2/ianjoffe/outputs/unpatched/" + DATASET + "/R2out.pkl",
                     "N1out":"/net/scratch2/ianjoffe/outputs/unpatched/" + DATASET + "/N1out.pkl",
                     "N2out":"/net/scratch2/ianjoffe/outputs/unpatched/" + DATASET + "/N2out.pkl",
-                    "D1stream":"/net/scratch2/ianjoffe/activations/unpatched/" + DATASET + "/D1stream.pkl",
-                    "D2stream":"/net/scratch2/ianjoffe/activations/unpatched/" + DATASET + "/D2stream.pkl",
-                    "R1stream":"/net/scratch2/ianjoffe/activations/unpatched/" + DATASET + "/R1stream.pkl",
-                    "R2stream":"/net/scratch2/ianjoffe/activations/unpatched/" + DATASET + "/R2stream.pkl",
-                    "N1stream":"/net/scratch2/ianjoffe/activations/unpatched/" + DATASET + "/N1stream.pkl",
-                    "N2stream":"/net/scratch2/ianjoffe/activations/unpatched/" + DATASET + "/N2stream.pkl"}
+                    "D1stream":"/net/scratch2/ianjoffe/activations/unpatched/" + DATASET + "/" + REPRESENT_AT + "/D1stream.pkl",
+                    "D2stream":"/net/scratch2/ianjoffe/activations/unpatched/" + DATASET + "/" + REPRESENT_AT + "/D2stream.pkl",
+                    "R1stream":"/net/scratch2/ianjoffe/activations/unpatched/" + DATASET + "/" + REPRESENT_AT + "/R1stream.pkl",
+                    "R2stream":"/net/scratch2/ianjoffe/activations/unpatched/" + DATASET + "/" + REPRESENT_AT + "/R2stream.pkl",
+                    "N1stream":"/net/scratch2/ianjoffe/activations/unpatched/" + DATASET + "/" + REPRESENT_AT + "/N1stream.pkl",
+                    "N2stream":"/net/scratch2/ianjoffe/activations/unpatched/" + DATASET + "/" + REPRESENT_AT + "/N2stream.pkl"}
     
     
     for i in range(INITIAL_POSITION, ENDING_POSITION, INFERENCE_BATCH_SIZE):
@@ -140,12 +162,13 @@ def main():
         model_outputs = model_saving_intermediates(input_batch, token_positions=input_token_pos).untag("seq")[-1]
 
         intermediates = pz.nx.stack([
-            saver.saved.value for saver in (
+            saver.saved.value.untag("seq")[-1]            
+            for saver in (
                 pz.select(model_saving_intermediates)
                 .at_instances_of(save_intermediates.SaveIntermediate)
-                .get_sequence()
+                .get_sequence()                            
             )
-        ], axis_name="layer").untag("seq")[-1]
+        ], axis_name="layer")
 
         # save output and activation to runtime's data structure
         for p in range(num_prompts):
@@ -162,6 +185,12 @@ def main():
                 streams[p][0] = pz.nx.concatenate(streams[p], "bill")
 
             for lst in pickle_files.keys():
+
+                #### DO NOT SAVE OUTPUTS ####
+                if "activations" not in pickle_files[lst]:
+                    continue
+                #############################
+
                 if Path(pickle_files[lst]).is_file():
                     with open(pickle_files[lst], "rb") as f:
                         previous_entries = pickle.load(f)
@@ -193,6 +222,7 @@ if __name__ == "__main__":
     SAVE_FREQUENCY = query.get("SAVE_FREQUENCY")
     INITIAL_POSITION = query.get("INITIAL_POSITION")
     ENDING_POSITION = query.get("ENDING_POSITION")
+    REPRESENT_AT = query.get("REPRESENT_AT")
 
     output_directory = Path("submitit_outputs").resolve()
     executor = submitit.AutoExecutor(folder=output_directory)

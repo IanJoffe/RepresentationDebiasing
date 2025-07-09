@@ -3,8 +3,9 @@
     "DATASET": "train", 
     "INFERENCE_BATCH_SIZE": 1,
     "SAVE_FREQUENCY": 40,
-    "INITIAL_POSITION": 3241,
-    "ENDING_POSITION": 10000,
+    "INITIAL_POSITION": 0,
+    "ENDING_POSITION": 1000,
+    "REPRESENT_AT": "pre-feedforward",
     "slurm": {
         "slurm_partition": "general",
         "slurm_job_name": "inference",
