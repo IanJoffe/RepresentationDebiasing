@@ -4,6 +4,8 @@ import submitit
 import os, tempfile
 from pathlib import Path
 import pickle
+from dataclasses import replace as dc_replace
+from copy import deepcopy
 
 import jax
 import jax.numpy as jnp
@@ -152,6 +154,73 @@ def get_debiased_model(original_model, activation_num, direction=None, DStream_d
         lambda model: [layer for layer in model.body.sublayers if isinstance(layer, penzai.models.transformer.model_parts.TransformerBlock)][activation_num]
     ).insert_after(DebiasRepresentation(direction, factor))
 
+@pz.pytree_dataclass
+class DebiasRepresentationHead(pz.nn.Layer):
+    direction: jnp.ndarray
+    factor:    float
+    head_idx:  int
+
+    def __call__(self, z, /, **unused_side_inputs):
+        """
+        z shape: [batch , seq , heads , 256]
+        We project the selected head onto `direction` and
+        add  `factor * projection * direction`  back in place.
+        """
+        return z.at[{ "query_heads": self.head_idx }].add(self.factor * self.direction)
+    
+def make_patch_attention_head(head_idx, direction, factor):
+    def _patch(attn):
+        subs = list(attn.attn_value_to_output.sublayers)          # any length
+        new_subs = (
+            subs[:-1]                                             # everything up to (but not incl.) WO
+            + [DebiasRepresentationHead(direction, factor, head_idx)]     # add exactly one edit
+            + subs[-1:]                                           # keep the original WO
+        )
+        return dc_replace(attn, attn_value_to_output=pz.nn.Sequential(new_subs))
+    return _patch 
+
+def get_head_debiased_model(original_model, num_heads=30, directions=None, DStream_data=None, RStream_data=None, factor=1, normalize_factor=True):
+    assert (((DStream_data is not None) and (RStream_data is not None)) or (directions is not None)) and not (((DStream_data is not None) and (RStream_data is not None)) and (directions is not None)), \
+        "Debiased model must take in either streams to calculate the direction, or the direction itself"
+    assert not normalize_factor if DStream_data is None else True, \
+        "Cannot normalize the factor unless provided with the full unpatched stream"
+    if directions is None:
+        mean_activation_diffs = pz.nx.nmap(jnp.linalg.norm)(
+                                    pz.nx.nmap(jnp.mean)(
+                                        (RStream_data - DStream_data).untag("projection")
+                                    )
+                                )
+        directions = ((RStream_data - DStream_data) / mean_activation_diffs).untag("bill").mean()
+    self_similarlity = abs(pz.nx.nmap(jnp.corrcoef)(
+            ((RStream_data - DStream_data) / mean_activation_diffs).untag("projection"), directions.untag("projection")
+        )[0][1].untag("bill").mean())
+
+    flat = self_similarlity.untag("layer", "query_heads").ravel()
+    flat = pz.nx.nmap(jnp.where)(pz.nx.nmap(jnp.isnan)(flat), -np.inf, flat)
+    idx = pz.nx.nmap(jnp.argpartition)(-flat, num_heads)[:num_heads]
+    layer_ix, head_ix = pz.nx.nmap(jnp.unravel_index)(idx, (self_similarlity.named_shape["layer"], self_similarlity.named_shape["query_heads"]))
+    
+    debiased_model = deepcopy(original_model)
+
+    for i in range(num_heads):
+        layer = layer_ix[i]
+        head = head_ix[i]
+        direction = directions.untag("layer")[layer].untag("query_heads")[head]
+        if normalize_factor:
+            factor = factor * mean_activation_diffs.untag("bill").mean().untag("layer")[layer].untag("query_heads")[head]
+        debiased_model = (
+            pz.select(debiased_model)
+            .at(lambda m: [
+                    blk for blk in m.body.sublayers 
+                    if isinstance(blk, penzai.models.transformer.model_parts.TransformerBlock)
+                ][layer])
+            .at_instances_of(penzai.nn.attention.Attention)
+            .apply(make_patch_attention_head(head, direction, factor))
+        )
+
+    return debiased_model
+
+
 
 def main():
     print(query)
@@ -185,17 +254,25 @@ def main():
     D1out, D2out, R1out, R2out, N1out, N2out = [], [], [], [], [], []
     outputs = [D1out, D2out, R1out, R2out, N1out, N2out]
     saving_dir_prefix = "/net/scratch2/ianjoffe/"
-    pickle_files = {"D1out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/D1out.pkl",
-                    "D2out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/D2out.pkl",
-                    "R1out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/R1out.pkl",
-                    "R2out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/R2out.pkl",
-                    "N1out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/N1out.pkl",
-                    "N2out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/N2out.pkl"}
+    if PATCHING_LOCATION == "post-feedforward":
+        pickle_files = {"D1out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/D1out.pkl",
+                        "D2out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/D2out.pkl",
+                        "R1out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/R1out.pkl",
+                        "R2out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/R2out.pkl",
+                        "N1out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/N1out.pkl",
+                        "N2out": saving_dir_prefix + "outputs/patched/layer" + str(PATCHING_ACTIVATION_NUM) + "/" + str(STEERING_COEF).replace("0.", "_") + "/N2out.pkl"}
+    elif PATCHING_LOCATION == "pre-feedforward":
+        pickle_files = {"D1out": saving_dir_prefix + "outputs/patched/" + str(NUM_HEADS) + "heads/" + str(STEERING_COEF).replace("0.", "_") + "/D1out.pkl",
+                        "D2out": saving_dir_prefix + "outputs/patched/" + str(NUM_HEADS) + "heads/" + str(STEERING_COEF).replace("0.", "_") + "/D2out.pkl",
+                        "R1out": saving_dir_prefix + "outputs/patched/" + str(NUM_HEADS) + "heads/" + str(STEERING_COEF).replace("0.", "_") + "/R1out.pkl",
+                        "R2out": saving_dir_prefix + "outputs/patched/" + str(NUM_HEADS) + "heads/" + str(STEERING_COEF).replace("0.", "_") + "/R2out.pkl",
+                        "N1out": saving_dir_prefix + "outputs/patched/" + str(NUM_HEADS) + "heads/" + str(STEERING_COEF).replace("0.", "_") + "/N1out.pkl",
+                        "N2out": saving_dir_prefix + "outputs/patched/" + str(NUM_HEADS) + "heads/" + str(STEERING_COEF).replace("0.", "_") + "/N2out.pkl"}
     
     with open(saving_dir_prefix + "/outputs/unpatched/train/D1out.pkl", "rb") as f: D1out_original = pickle.load(f)
     with open(saving_dir_prefix + "/outputs/unpatched/train/R1out.pkl", "rb") as f: R1out_original = pickle.load(f)
-    with open(saving_dir_prefix + "/activations/unpatched/train/D1stream.pkl", "rb") as f: D1stream_original = pickle.load(f)
-    with open(saving_dir_prefix + "/activations/unpatched/train/R1stream.pkl", "rb") as f: R1stream_original = pickle.load(f)
+    with open(saving_dir_prefix + "/activations/unpatched/train/" + PATCHING_LOCATION + "/D1stream.pkl", "rb") as f: D1stream_original = pickle.load(f)
+    with open(saving_dir_prefix + "/activations/unpatched/train/" + PATCHING_LOCATION + "/R1stream.pkl", "rb") as f: R1stream_original = pickle.load(f)
 
     
     threshold = 0.1
@@ -204,10 +281,17 @@ def main():
     selected_idxs = np.concatenate([partisan_ranks[:int(len(partisan_ranks) * threshold)], partisan_ranks[int(len(partisan_ranks) * (1-threshold)):]])
     
     # summaries_df_minisample = training_summaries_df_sample.iloc[selected_idxs].reset_index(drop=False, names="supersample_idx")
-    debiased_model = get_debiased_model(model, PATCHING_ACTIVATION_NUM,
-                                        DStream_data=D1stream_original.untag("bill")[selected_idxs].tag("bill"),
-                                        RStream_data=R1stream_original.untag("bill")[selected_idxs].tag("bill"),
-                                        factor=STEERING_COEF)
+    
+    if PATCHING_LOCATION == "post-feedforward":
+        debiased_model = get_debiased_model(model, PATCHING_ACTIVATION_NUM,
+                                            DStream_data=D1stream_original.untag("bill")[selected_idxs].tag("bill"),
+                                            RStream_data=R1stream_original.untag("bill")[selected_idxs].tag("bill"),
+                                            factor=STEERING_COEF)
+    elif PATCHING_LOCATION == "pre-feedforward":
+        debiased_model = get_head_debiased_model(model, num_heads=NUM_HEADS,
+                                                DStream_data=D1stream_original.untag("bill")[selected_idxs].tag("bill"),
+                                                RStream_data=R1stream_original.untag("bill")[selected_idxs].tag("bill"),
+                                                factor=STEERING_COEF)
     
     
     for i in range(INITIAL_POSITION, ENDING_POSITION, INFERENCE_BATCH_SIZE):
@@ -265,6 +349,8 @@ if __name__ == "__main__":
     INITIAL_POSITION = query.get("INITIAL_POSITION")
     ENDING_POSITION = query.get("ENDING_POSITION")
 
+    PATCHING_LOCATION = query.get("PATCHING_LOCATION") # pre-feedforward OR post-feedforward
+    NUM_HEADS = query.get("NUM_HEADS")
     PATCHING_ACTIVATION_NUM = query.get("PATCHING_ACTIVATION_NUM")
     STEERING_COEF = query.get("STEERING_COEF")
 
